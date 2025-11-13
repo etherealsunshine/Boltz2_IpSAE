@@ -2,18 +2,28 @@
 # -*- coding: utf-8 -*-
 
 """
-Generalized binder validation script.
+Generate YAMLs and run scripts for binder validation from a single config file.
 
-✅ Binder is always chain A (appears first in YAML)
-✅ Targets / off-targets follow as B, C, ...
-✅ Supports multi-chain binders and targets
-✅ Allows --msa only when exactly one --target is specified
-✅ MSA applies only to target chains
-✅ Generates:
-   - YAMLs for all binder–target/off-target pairs
-   - Per-binder run.sh
-   - Global run_all_cofolding.sh
-   - Visualization helper script
+Usage:
+    python make_binder_validation_scripts.py --config config.yml
+
+Key features:
+  - Binder is always first in Boltz YAML and uses chain IDs: A, B, C, ...
+  - Partner (second entity) uses IDs depending on role:
+        target     → TA, TB, TC, ...
+        antitarget → AA, AB, AC, ...
+        (fallback) → PA, PB, PC, ... if role is unknown
+  - Supports multichain binders and multichain targets/antitargets.
+  - MSA can be provided for any chain via config (chains_msa).
+  - from_dir entries NEVER have MSAs (by design).
+  - Uses 'target_' / 'antitarget_' prefixes in YAML names:
+       binder_<binder>_vs_target_<name>.yaml
+       binder_<binder>_vs_antitarget_<name>.yaml
+  - Generates:
+       - Per-binder YAMLs for all binder–(anti)target pairs
+       - Per-binder run.sh
+       - Global run_all_cofolding.sh
+       - Visualization helper script
 """
 
 import argparse
@@ -21,6 +31,12 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("ERROR: PyYAML is required. Install with `pip install pyyaml`.")
 
 SANITIZE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -38,46 +54,162 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def parse_entity_arg(items):
-    """Parse command-line entries like name=SEQ[:SEQ2:SEQ3]."""
-    entities = []
-    for item in items:
-        if "=" not in item:
-            sys.exit(f"ERROR: Expected name=SEQS, got {item!r}")
-        name, seqs = item.split("=", 1)
-        name = sanitize_name(name)
-        chains = [s.strip().replace("\\n", "").replace("\n", "") for s in seqs.split(":") if s.strip()]
-        if not chains:
-            sys.exit(f"ERROR: No sequences found for {name!r}")
-        entities.append((name, chains))
-    return entities
+def read_fasta_multi(fasta_path: Path) -> List[str]:
+    """Read one FASTA file and return a list of sequences (one per record)."""
+    seqs: List[str] = []
+    seq: List[str] = []
+    with fasta_path.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if seq:
+                    seqs.append("".join(seq).replace(" ", "").upper())
+                    seq = []
+            else:
+                seq.append(line)
+    if seq:
+        seqs.append("".join(seq).replace(" ", "").upper())
+    return seqs
 
 
-def read_fasta_dir_entities(fasta_dir: Path):
-    """Read FASTA files from a directory -> list[(name, [seqs])]."""
-    entities = []
+def read_fasta_dir_entities(fasta_dir: Path) -> List[Tuple[str, List[str]]]:
+    """
+    Read all FASTA-like files in a directory.
+    Returns list of (entity_name, [seqs]).
+    """
+    entities: List[Tuple[str, List[str]]] = []
     for fasta_path in sorted(fasta_dir.glob("*")):
-        if not fasta_path.is_file() or not fasta_path.suffix.lower() in {".fasta", ".fa", ".fna", ".faa", ".txt"}:
+        if not fasta_path.is_file() or fasta_path.suffix.lower() not in {
+            ".fasta",
+            ".fa",
+            ".fna",
+            ".faa",
+            ".txt",
+        }:
             continue
         name = sanitize_name(fasta_path.stem)
-        seqs, seq = [], []
-        with open(fasta_path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith(">"):
-                    if seq:
-                        seqs.append("".join(seq).replace(" ", "").upper())
-                        seq = []
-                else:
-                    seq.append(line)
-            if seq:
-                seqs.append("".join(seq).replace(" ", "").upper())
+        seqs = read_fasta_multi(fasta_path)
         if seqs:
             entities.append((name, seqs))
     return entities
 
 
-def make_master_run_sh(output_root: Path):
+def add_n_terminal_lysine(seqs: List[str]) -> List[str]:
+    """Prepend 'K' if missing at N-terminus for each sequence."""
+    return [("K" + s if not s.startswith("K") else s) for s in seqs]
+
+
+# ---------------------------------------------------------------------------
+
+def _alpha_suffix(idx: int) -> str:
+    """
+    Return a letter-like suffix for chain indices: A, B, C, ... Z, X26, X27, ...
+    (Only the first 26 are pretty; beyond that we degrade gracefully.)
+    """
+    if idx < 26:
+        return chr(ord("A") + idx)
+    return "X" + str(idx)
+
+
+def _partner_chain_id(role: str, idx: int) -> str:
+    """
+    Partner chain IDs:
+        target     → TA, TB, ...
+        antitarget → AA, AB, ...
+        other      → PA, PB, ...
+    """
+    role = (role or "").lower()
+    if role == "target":
+        prefix = "T"
+    elif role == "antitarget":
+        prefix = "A"
+    else:
+        prefix = "P"
+    return prefix + _alpha_suffix(idx)
+
+
+def yaml_for_pair(
+    binder_seqs: List[str],
+    partner_seqs: List[str],
+    partner_role: str,
+    binder_msas: Optional[List[Optional[str]]] = None,
+    partner_msas: Optional[List[Optional[str]]] = None,
+) -> str:
+    """
+    Build Boltz YAML for a binder–partner pair.
+
+    - Binder chains first with IDs: A, B, C, ...
+    - Partner chains next with IDs depending on role:
+          target     → TA, TB, ...
+          antitarget → AA, AB, ...
+          other      → PA, PB, ...
+
+    If any MSA is provided for binder or partner chains, then EVERY chain gets
+    an 'msa:' entry. Chains without a file get 'msa: empty'.
+
+    YAML format for Boltz stays:
+
+        version: 1
+        sequences:
+          - protein:
+              id: ...
+              sequence: ...
+              msa: <optional field>
+    """
+
+    lines: List[str] = ["version: 1", "sequences:"]
+
+    binder_msas = binder_msas or [None] * len(binder_seqs)
+    partner_msas = partner_msas or [None] * len(partner_seqs)
+
+    # --- Binder chains (A, B, ...) ---
+    for i, seq in enumerate(binder_seqs):
+        cid = chr(ord("A") + i)
+        lines.append("  - protein:")
+        lines.append(f"      id: {cid}")
+        lines.append(f"      sequence: {seq}")
+        msa_path = binder_msas[i] if i < len(binder_msas) and binder_msas[i] else "empty"
+        lines.append(f"      msa: {msa_path}")
+
+    # --- Partner chains (TA/TB/... or AA/AB/...) ---
+    for i, seq in enumerate(partner_seqs):
+        cid = _partner_chain_id(partner_role, i)
+        lines.append("  - protein:")
+        lines.append(f"      id: {cid}")
+        lines.append(f"      sequence: {seq}")
+        msa_path = partner_msas[i] if i < len(partner_msas) and partner_msas[i] else "empty"
+        lines.append(f"      msa: {msa_path}")
+
+    return "\n".join(lines) + "\n"
+
+
+def make_run_sh(
+    dir_path: Path,
+    yaml_paths: List[Path],
+    recycling_steps: Optional[int],
+    diffusion_samples: Optional[int],
+    use_msa_server: bool,
+) -> None:
+    """Create per-binder run.sh."""
+    lines: List[str] = ["#!/bin/bash", "set -e", ""]
+    for p in yaml_paths:
+        cmd = ["boltz", "predict", p.name]
+        if recycling_steps is not None:
+            cmd += ["--recycling_steps", str(recycling_steps)]
+        if use_msa_server:
+            cmd.append("--use_msa_server")
+        if diffusion_samples is not None:
+            cmd += ["--diffusion_samples", str(diffusion_samples)]
+        cmd += ["--out_dir", os.path.join(dir_path, "outputs")]
+        lines.append(" ".join(cmd))
+    run_path = dir_path / "run.sh"
+    write_text(run_path, "\n".join(lines) + "\n")
+    os.chmod(run_path, 0o755)
+
+
+def make_master_run_sh(output_root: Path) -> None:
     """Generate top-level script to run all binder run.sh scripts."""
     lines = [
         "#!/bin/bash",
@@ -86,7 +218,7 @@ def make_master_run_sh(output_root: Path):
         "# Run all binder_* run.sh scripts",
         'for f in $(find . -type f -name "run.sh" | sort); do',
         '  echo "Running $f..."',
-        '  (cd \"$(dirname \"$f\")\" && bash run.sh)',
+        '  (cd "$(dirname "$f")" && bash run.sh)',
         "done",
         "",
     ]
@@ -96,7 +228,7 @@ def make_master_run_sh(output_root: Path):
     print(f"✅ Created {run_all_path}")
 
 
-def make_visualisation_sh(output_root: Path):
+def make_visualisation_sh(output_root: Path) -> None:
     """Create visualization helper script."""
     lines = [
         f"python visualise_binder_validation.py --root_dir {output_root} --generate_data --plot"
@@ -106,123 +238,294 @@ def make_visualisation_sh(output_root: Path):
     os.chmod(sh_path, 0o755)
     print(f"✅ Created {sh_path}")
 
-def yaml_for_pair(binder_seqs, target_seqs, msa_path=None):
+
+# ---------------------------------------------------------------------------
+# Config parsing
+# ---------------------------------------------------------------------------
+
+def load_config(path: Path) -> Dict[str, Any]:
+    with path.open() as fh:
+        cfg = yaml.safe_load(fh)
+    if not isinstance(cfg, dict):
+        raise ValueError("Top-level config must be a mapping.")
+    return cfg
+
+
+def get_global_option(cfg: Dict[str, Any], *keys, default=None):
+    """Convenience for nested global options."""
+    node = cfg.get("global", {})
+    for k in keys:
+        if not isinstance(node, dict):
+            return default
+        node = node.get(k, default)
+    return node
+
+
+def parse_chains_msa(entry: Dict[str, Any], n_chains: int) -> List[Optional[str]]:
     """
-    ✅ Binder always first in YAML (chain A)
-    ✅ If msa_path is given → all chains must have msa (binder: empty, target: msa)
+    Interpret 'chains_msa' mapping from config as a list of per-chain MSA paths.
+    Keys can be int or string; indices are 0-based.
     """
-    lines = ["version: 1", "sequences:"]
-
-    # --- Binder first (chain A, etc.) ---
-    for i, seq in enumerate(binder_seqs):
-        cid = chr(ord("A") + i)
-        lines.append("  - protein:")
-        lines.append(f"      id: {cid}")
-        lines.append(f"      sequence: {seq}")
-        if msa_path:
-            lines.append("      msa: empty")
-
-    # --- Then target/off-targets (chains B, C, …) ---
-    start_idx = len(binder_seqs)
-    for i, seq in enumerate(target_seqs):
-        cid = chr(ord("A") + start_idx + i)
-        lines.append("  - protein:")
-        lines.append(f"      id: {cid}")
-        lines.append(f"      sequence: {seq}")
-        if msa_path:
-            lines.append(f"      msa: {msa_path}")
-
-    return "\n".join(lines) + "\n"
+    msas: List[Optional[str]] = [None] * n_chains
+    raw = entry.get("chains_msa") or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"chains_msa must be a mapping, got {type(raw)}")
+    for k, v in raw.items():
+        try:
+            idx = int(k)
+        except Exception:
+            raise ValueError(f"chains_msa key must be an integer index, got {k!r}")
+        if 0 <= idx < n_chains:
+            if v is not None:
+                msas[idx] = str(v)
+        else:
+            print(f"WARNING: chains_msa index {idx} out of range for {n_chains} chains; ignoring.")
+    return msas
 
 
-def make_run_sh(dir_path: Path, yaml_paths, use_msa_server=True):
-    """Create per-binder run.sh."""
-    lines = [
-        f"boltz predict {p.name} --recycling_steps 10 {'--use_msa_server' if use_msa_server else ''}"
-        f"--diffusion_samples 5 --out_dir {os.path.join(dir_path, 'outputs')}"
-        for p in yaml_paths
-    ]
-    run_path = dir_path / "run.sh"
-    write_text(run_path, "\n".join(lines) + "\n")
-    os.chmod(run_path, 0o755)
+def build_binder_entities(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Build internal representation of binders:
+      {name, seqs, msas}
+    """
+    binders_cfg = cfg.get("binders") or []
+    if not isinstance(binders_cfg, list):
+        raise ValueError("binders must be a list.")
 
+    global_addK = bool(get_global_option(cfg, "add_n_terminal_lysine", default=False))
+    result: List[Dict[str, Any]] = []
+
+    for entry in binders_cfg:
+        if not isinstance(entry, dict):
+            raise ValueError("Each binder entry must be a mapping.")
+
+        # Case: from_dir (NO MSAs)
+        if "from_dir" in entry:
+            dir_path = Path(entry["from_dir"]).resolve()
+            if not dir_path.is_dir():
+                raise ValueError(f"Binder from_dir not found: {dir_path}")
+            addK = bool(entry.get("add_n_terminal_lysine", global_addK))
+            for name, seqs in read_fasta_dir_entities(dir_path):
+                if addK:
+                    seqs = add_n_terminal_lysine(seqs)
+                # from_dir entries: explicitly NO MSAs
+                msas = [None] * len(seqs)
+                result.append(
+                    {"name": sanitize_name(name), "seqs": seqs, "msas": msas}
+                )
+            continue
+
+        # Case: explicit binder
+        if "name" not in entry:
+            raise ValueError("Explicit binder entry must have a 'name'.")
+        name = sanitize_name(entry["name"])
+
+        # Sequences source: either 'sequences' or 'fasta'
+        seqs: Optional[List[str]] = None
+        if "sequences" in entry:
+            raw_seqs = entry["sequences"]
+            if not isinstance(raw_seqs, list) or not raw_seqs:
+                raise ValueError(f"Binder {name}: 'sequences' must be a non-empty list.")
+            seqs = [
+                str(s).replace("\\n", "").replace("\n", "").replace(" ", "").upper()
+                for s in raw_seqs
+            ]
+        elif "fasta" in entry:
+            fasta_path = Path(entry["fasta"]).resolve()
+            if not fasta_path.is_file():
+                raise ValueError(f"Binder {name}: FASTA not found: {fasta_path}")
+            seqs = read_fasta_multi(fasta_path)
+        else:
+            raise ValueError(f"Binder {name}: must specify 'sequences' or 'fasta'.")
+
+        if not seqs:
+            raise ValueError(f"Binder {name}: no sequences found.")
+
+        addK = bool(entry.get("add_n_terminal_lysine", global_addK))
+        if addK:
+            seqs = add_n_terminal_lysine(seqs)
+
+        msas = parse_chains_msa(entry, len(seqs))
+        result.append({"name": name, "seqs": seqs, "msas": msas})
+
+    if not result:
+        raise ValueError("No binders defined in config.")
+    return result
+
+
+def build_target_entities(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Build internal representation of targets / antitargets:
+      {name, role, seqs, msas}
+    """
+    targets_cfg = cfg.get("targets") or []
+    if not isinstance(targets_cfg, list):
+        raise ValueError("targets must be a list.")
+
+    result: List[Dict[str, Any]] = []
+
+    for entry in targets_cfg:
+        if not isinstance(entry, dict):
+            raise ValueError("Each targets entry must be a mapping.")
+
+        # Case: from_dir (NO MSAs)
+        if "from_dir" in entry:
+            if "role" not in entry:
+                raise ValueError("targets[from_dir] entry must have a 'role' (target/antitarget).")
+            role = str(entry["role"]).lower()
+            if role not in {"target", "antitarget"}:
+                raise ValueError(f"Invalid role {role!r} (expected 'target' or 'antitarget').")
+            dir_path = Path(entry["from_dir"]).resolve()
+            if not dir_path.is_dir():
+                raise ValueError(f"Targets from_dir not found: {dir_path}")
+            for name, seqs in read_fasta_dir_entities(dir_path):
+                # from_dir entries: explicitly NO MSAs
+                msas = [None] * len(seqs)
+                result.append(
+                    {"name": sanitize_name(name), "role": role, "seqs": seqs, "msas": msas}
+                )
+            continue
+
+        # Case: explicit target / antitarget
+        if "name" not in entry:
+            raise ValueError("Explicit target entry must have a 'name'.")
+        if "role" not in entry:
+            raise ValueError(f"Target {entry['name']!r} must have a 'role' (target/antitarget).")
+
+        name = sanitize_name(entry["name"])
+        role = str(entry["role"]).lower()
+        if role not in {"target", "antitarget"}:
+            raise ValueError(
+                f"Target {name}: invalid role {role!r} (expected 'target' or 'antitarget')."
+            )
+
+        # Sequences source: either 'sequences' or 'fasta'
+        seqs: Optional[List[str]] = None
+        if "sequences" in entry:
+            raw_seqs = entry["sequences"]
+            if not isinstance(raw_seqs, list) or not raw_seqs:
+                raise ValueError(f"Target {name}: 'sequences' must be a non-empty list.")
+            seqs = [
+                str(s).replace("\\n", "").replace("\n", "").replace(" ", "").upper()
+                for s in raw_seqs
+            ]
+        elif "fasta" in entry:
+            fasta_path = Path(entry["fasta"]).resolve()
+            if not fasta_path.is_file():
+                raise ValueError(f"Target {name}: FASTA not found: {fasta_path}")
+            seqs = read_fasta_multi(fasta_path)
+        else:
+            raise ValueError(f"Target {name}: must specify 'sequences' or 'fasta'.")
+
+        if not seqs:
+            raise ValueError(f"Target {name}: no sequences found.")
+
+        msas = parse_chains_msa(entry, len(seqs))
+        result.append({"name": name, "role": role, "seqs": seqs, "msas": msas})
+
+    if not result:
+        raise ValueError("No targets/antitargets defined in config.")
+    return result
+
+
+# ---------------------------------------------------------------------------
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Generate YAMLs and run scripts for binder validation.")
-    ap.add_argument("--output_dir", required=True, help="Output directory.")
-    ap.add_argument("--binder", action="append", help="Binder as name=SEQ[:SEQ2]")
-    ap.add_argument("--target", action="append", help="Target as name=SEQ[:SEQ2]")
-    ap.add_argument("--off_target", action="append", help="Off-target as name=SEQ[:SEQ2]")
-    ap.add_argument("--binder_dir", help="Directory with binder FASTA files.")
-    ap.add_argument("--target_dir", help="Directory with target FASTA files.")
-    ap.add_argument("--off_target_dir", help="Directory with off-target FASTA files.")
-    ap.add_argument("--msa", help="Optional MSA file (only allowed when exactly one --target).")
-    ap.add_argument("--add_n_terminal_lysine", action="store_true",
-                    help="Prepend 'K' to each binder chain if missing.")
+    ap = argparse.ArgumentParser(
+        description="Generate YAMLs and run scripts for binder validation from a YAML config."
+    )
+    ap.add_argument("--config", required=True, help="Path to config YAML.")
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
-    output_root = Path(args.output_dir).resolve()
+    cfg_path = Path(args.config).resolve()
+    if not cfg_path.is_file():
+        sys.exit(f"ERROR: Config file not found: {cfg_path}")
+
+    cfg = load_config(cfg_path)
+
+    output_root = Path(cfg.get("output_dir", "./boltz_validation")).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
-    binders, targets, off_targets = [], [], []
-    if args.binder:
-        binders.extend(parse_entity_arg(args.binder))
-    if args.binder_dir:
-        binders.extend(read_fasta_dir_entities(Path(args.binder_dir)))
+    binders = build_binder_entities(cfg)
+    targets_all = build_target_entities(cfg)
 
-    if args.target:
-        targets.extend(parse_entity_arg(args.target))
-    if args.target_dir:
-        targets.extend(read_fasta_dir_entities(Path(args.target_dir)))
+    # Separate into "targets" vs "antitargets" (but keep role info on each)
+    targets = [t for t in targets_all if t["role"] == "target"]
+    antitargets = [t for t in targets_all if t["role"] == "antitarget"]
 
-    if args.off_target:
-        off_targets.extend(parse_entity_arg(args.off_target))
-    if args.off_target_dir:
-        off_targets.extend(read_fasta_dir_entities(Path(args.off_target_dir)))
+    if not targets and not antitargets:
+        sys.exit("ERROR: Must have at least one target or antitarget defined.")
 
-    if not binders:
-        sys.exit("ERROR: Must provide at least one binder (--binder or --binder_dir).")
-    if not (targets or off_targets):
-        sys.exit("ERROR: Must provide at least one target or off-target (--target or --target_dir).")
-
-    # --- Validate MSA ---
-    msa_path = args.msa
-    if msa_path:
-        if len(targets) != 1 or args.target_dir:
-            sys.exit("ERROR: --msa can only be used when exactly one --target is provided.")
-        msa_path = Path(msa_path).resolve()
-        if not msa_path.exists():
-            sys.exit(f"ERROR: MSA file not found: {msa_path}")
-
-    # --- Optional N-terminal K ---
-    if args.add_n_terminal_lysine:
-        binders = [
-            (n, ["K" + s if not s.startswith("K") else s for s in seqs])
-            for n, seqs in binders
-        ]
+    # Boltz defaults
+    boltz_cfg = get_global_option(cfg, "boltz", default={}) or {}
+    recycling_steps = boltz_cfg.get("recycling_steps", 10)
+    diffusion_samples = boltz_cfg.get("diffusion_samples", 5)
+    use_msa_server_mode = str(boltz_cfg.get("use_msa_server", "auto")).lower()
+    if use_msa_server_mode not in {"auto", "true", "false"}:
+        sys.exit("ERROR: global.boltz.use_msa_server must be 'auto', 'true', or 'false'.")
 
     # --- Generate YAMLs and run.sh for each binder ---
-    for bname, bseqs in binders:
+    for binder in binders:
+        bname = binder["name"]
+        bseqs = binder["seqs"]
+        bmsas = binder["msas"]
+
         binder_dir = output_root / f"binder_{bname}"
         binder_dir.mkdir(parents=True, exist_ok=True)
-        yaml_paths = []
+
+        yaml_paths: List[Path] = []
+        any_pair_uses_msa = False
 
         # Binder vs targets
-        for tname, tseqs in targets:
-            ypath = binder_dir / f"binder_{bname}_vs_{sanitize_name(tname)}.yaml"
-            write_text(ypath, yaml_for_pair(bseqs, tseqs, msa_path))
+        for tgt in targets:
+            tname = tgt["name"]
+            tseqs = tgt["seqs"]
+            tmsas = tgt["msas"]
+
+            yname = f"binder_{bname}_vs_target_{tname}.yaml"
+            ypath = binder_dir / yname
+            text = yaml_for_pair(bseqs, tseqs, partner_role="target",
+                                 binder_msas=bmsas, partner_msas=tmsas)
+            write_text(ypath, text)
             yaml_paths.append(ypath)
 
-        # Binder vs off-targets
-        for oname, oseqs in off_targets:
-            ypath = binder_dir / f"binder_{bname}_vs_{sanitize_name(oname)}.yaml"
-            write_text(ypath, yaml_for_pair(bseqs, oseqs))
+            if any(bmsas) or any(tmsas):
+                any_pair_uses_msa = True
+
+        # Binder vs antitargets
+        for at in antitargets:
+            aname = at["name"]
+            aseqs = at["seqs"]
+            amsas = at["msas"]
+
+            yname = f"binder_{bname}_vs_antitarget_{aname}.yaml"
+            ypath = binder_dir / yname
+            text = yaml_for_pair(bseqs, aseqs, partner_role="antitarget",
+                                 binder_msas=bmsas, partner_msas=amsas)
+            write_text(ypath, text)
             yaml_paths.append(ypath)
 
-        make_run_sh(binder_dir, yaml_paths, use_msa_server= not bool(msa_path))
+            if any(bmsas) or any(amsas):
+                any_pair_uses_msa = True
+
+        # Decide use_msa_server for this binder
+        if use_msa_server_mode == "true":
+            use_msa_server = True
+        elif use_msa_server_mode == "false":
+            use_msa_server = False
+        else:  # auto
+            use_msa_server = not any_pair_uses_msa
+
+        make_run_sh(
+            binder_dir,
+            yaml_paths,
+            recycling_steps=recycling_steps,
+            diffusion_samples=diffusion_samples,
+            use_msa_server=use_msa_server,
+        )
 
     make_master_run_sh(output_root)
     make_visualisation_sh(output_root)

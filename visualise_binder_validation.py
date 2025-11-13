@@ -4,9 +4,31 @@
 """
 Visualize Boltz/ipSAE validation outputs.
 
-✅ Binder is always chain A.
-✅ Parses all numeric ipSAE metrics (min/max).
-✅ Aggregates and plots results for interactions involving chain A only.
+Key assumptions / behaviour:
+
+- Boltz configs use chain IDs:
+    * Binder chains: A, B, C, ...
+    * Target chains: TA, TB, TC, ...
+    * Antitarget chains: AA, AB, AC, ...
+- Binder is always the A-chain (chain_of_focus = "A").
+- Boltz outputs live under:
+      binder_<binder_name>/outputs/boltz_results_<yaml_stem>/
+- YAML stems look like:
+      binder_<binder>_vs_target_<target>
+      binder_<binder>_vs_antitarget_<name>
+
+This script:
+  * runs ipSAE on all models for each binder–(anti)target pair
+  * extracts metrics for chain A vs its best partner
+  * stores:
+        - binder
+        - vs (full name)
+        - partner (e.g. Spike, HA, ...)
+        - target_type (target / antitarget / unknown)
+        - model_idx
+        - numeric ipSAE metrics (_min, _max)
+  * makes per-binder stripplots (all targets & antitargets together)
+  * makes global heatmaps (ipSAE_min, ipSAE_max) averaged across models
 """
 
 import argparse
@@ -29,16 +51,16 @@ def run_ipsae(
 ):
     """
     Run ipsae.py and compute min/max metrics for chain_of_focus.
-    
+
     If multiple partner chains exist, choose the one with the highest ipSAE_max
     (using only ASYM rows). Then compute metric_min / metric_max from only
     those rows.
     """
 
-    import subprocess
     import pandas as pd
     import numpy as np
     import os
+    import subprocess
 
     # ---------------------------
     # Run ipSAE
@@ -61,7 +83,7 @@ def run_ipsae(
     # ---------------------------
     try:
         df = pd.read_csv(out_txt, sep=None, engine="python")
-    except:
+    except Exception:
         df = pd.read_csv(out_txt, delim_whitespace=True)
 
     # Convert numeric where possible
@@ -92,7 +114,6 @@ def run_ipsae(
     for _, row in df.iterrows():
         partner = row[chn2_col] if row[chn1_col] == chain_of_focus else row[chn1_col]
         partners.add(partner)
-
     partners = sorted(partners)
 
     # ---------------------------
@@ -100,25 +121,23 @@ def run_ipsae(
     # ---------------------------
     partner_best = None
     partner_best_score = -np.inf
+    best_df = None
 
     for p in partners:
-        # rows for A–p only
         sub = df[
             ((df[chn1_col] == chain_of_focus) & (df[chn2_col] == p)) |
             ((df[chn2_col] == chain_of_focus) & (df[chn1_col] == p))
         ]
-
         if sub.empty:
             continue
 
         ipSAE_max = sub["ipSAE"].max()
-
         if ipSAE_max > partner_best_score:
             partner_best_score = ipSAE_max
             partner_best = p
             best_df = sub.copy()
 
-    if partner_best is None:
+    if partner_best is None or best_df is None:
         raise ValueError(f"No valid partner rows found for {chain_of_focus}")
 
     # ---------------------------
@@ -129,7 +148,7 @@ def run_ipsae(
 
     output = {
         "chain_of_focus": chain_of_focus,
-        "involved_chains": partner_best              # <--- single best partner
+        "involved_chains": partner_best
     }
 
     for col in numeric_cols:
@@ -139,6 +158,22 @@ def run_ipsae(
     return output
 
 
+def parse_vs_name(vs_name: str):
+    """
+    Parse vs_name of the form:
+        binder_<binder>_vs_target_<partner>
+        binder_<binder>_vs_antitarget_<partner>
+    Returns (partner_name, target_type).
+    """
+    m = re.search(r"_vs_(target|antitarget)_(.*)$", vs_name)
+    if m:
+        target_type = m.group(1)  # 'target' or 'antitarget'
+        partner_name = m.group(2)
+    else:
+        target_type = "unknown"
+        m2 = re.search(r"_vs_(.*)$", vs_name)
+        partner_name = m2.group(1) if m2 else vs_name
+    return partner_name, target_type
 
 
 def analyse_binder(binder_dir: Path):
@@ -154,6 +189,8 @@ def analyse_binder(binder_dir: Path):
         vs_name = vs_dir.name.replace("boltz_results_", "")
         pred_root = vs_dir / "predictions" / vs_name
 
+        partner_name, target_type = parse_vs_name(vs_name)
+
         for pae_file in pred_root.glob("pae_*_model_*.npz"):
             m = re.search(r"model_(\d+)", pae_file.name)
             if not m:
@@ -163,23 +200,26 @@ def analyse_binder(binder_dir: Path):
             if not cif_file.exists():
                 continue
 
-            rec = run_ipsae(pae_file, cif_file, chain_of_focus="A")
+            try:
+                rec = run_ipsae(pae_file, cif_file, chain_of_focus="A")
+            except Exception as e:
+                print(f"⚠️ ipSAE failed for {pae_file} ({e}). Skipping.")
+                continue
+
             rec.update({
                 "binder": binder_dir.name,
                 "vs": vs_name,
-                "model_idx": model_idx,
-                "partner": rec["involved_chains"],  # add partner column
+                "model_idx": int(model_idx),
+                "partner": partner_name,
+                "target_type": target_type,
             })
             binder_records.append(rec)
-
 
     if not binder_records:
         print(f"No valid ipSAE data for {binder_dir.name}")
         return
 
     df = pd.DataFrame(binder_records)
-    df["model_idx"] = df["model_idx"].astype(int)
-    df["partner"] = df["vs"].str.extract(r"_vs_(.*)$")
 
     csv_path = plots_dir / "ipsae_summary_chainA.csv"
     df.to_csv(csv_path, index=False)
@@ -188,20 +228,31 @@ def analyse_binder(binder_dir: Path):
     partner_order = sorted(df["partner"].dropna().unique().tolist())
 
     for metric in metrics:
+        if metric not in df.columns:
+            continue
         plt.figure(figsize=(6, 3.5))
-        sns.stripplot(data=df, x="partner", y=metric,
-                      hue="model_idx", alpha=0.7, order=partner_order)
+        sns.stripplot(
+            data=df,
+            x="partner",
+            y=metric,
+            hue="model_idx",
+            alpha=0.7,
+            order=partner_order,
+        )
         short_title = re.sub(r"^binder_", "", binder_dir.name)
         plt.title(f"{metric} for {short_title}")
         plt.ylabel(metric)
-        plt.xlabel("Target / Off-target")
+        plt.xlabel("Target / Antitarget")
         plt.xticks(rotation=30)
         handles, labels = plt.gca().get_legend_handles_labels()
         if labels:
             order_idx = sorted(range(len(labels)), key=lambda i: int(labels[i]))
-            plt.legend([handles[i] for i in order_idx],
-                       [labels[i] for i in order_idx],
-                       title="model_idx", loc="best")
+            plt.legend(
+                [handles[i] for i in order_idx],
+                [labels[i] for i in order_idx],
+                title="model_idx",
+                loc="best",
+            )
         plt.tight_layout()
         for ext in ["png"]:
             plt.savefig(plots_dir / f"{metric}_stripplot_chainA.{ext}", dpi=200)
@@ -209,10 +260,14 @@ def analyse_binder(binder_dir: Path):
 
     print(f"Saved: {csv_path}")
 
+
 def plot_overall(root_dir: Path):
     """
     Combine all per-binder CSVs and plot heatmaps for ipSAE_min and ipSAE_max
     (averages across models).
+
+    All targets & antitargets are pooled together; target_type is kept in the
+    DataFrame but not used to split the plots (for now).
     """
     csvs = list(root_dir.glob("binder_*/plots/ipsae_summary_chainA.csv"))
     if not csvs:
@@ -222,14 +277,18 @@ def plot_overall(root_dir: Path):
     dfs = []
     for csv in csvs:
         df = pd.read_csv(csv)
-        df["partner"] = df["vs"].str.extract(r"_vs_(.*)$")
+        # Backwards compatibility: older CSVs may not have 'partner' or 'target_type'
+        if "partner" not in df.columns and "vs" in df.columns:
+            df["partner"] = df["vs"].str.extract(r"_vs_(.*)$")
+        if "target_type" not in df.columns and "vs" in df.columns:
+            df["target_type"] = "unknown"
+
         df["binder_short"] = df["binder"].str.replace(r"^binder_", "", regex=True)
         dfs.append(df)
 
     all_df = pd.concat(dfs, ignore_index=True)
 
-    # Restrict to ipSAE_min and ipSAE_max columns
-    metrics = ["ipSAE_min", "ipSAE_max"]
+    metrics = [m for m in ["ipSAE_min", "ipSAE_max"] if m in all_df.columns]
     if not metrics:
         print("No ipSAE_min/ipSAE_max metrics found for heatmap plotting.")
         return
@@ -255,7 +314,7 @@ def plot_overall(root_dir: Path):
             vmax=1,
         )
         plt.title(metric)
-        plt.ylabel("Target / Off-target", rotation=90)
+        plt.ylabel("Target / Antitarget", rotation=90)
         plt.xlabel("Binder")
         plt.yticks(rotation=0)
         plt.tight_layout()
@@ -265,7 +324,6 @@ def plot_overall(root_dir: Path):
 
         plt.close()
         print(f"Saved heatmap for {metric}")
-
 
 
 def main():

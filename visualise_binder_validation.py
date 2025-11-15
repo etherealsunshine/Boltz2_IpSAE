@@ -103,7 +103,35 @@ def run_ipsae(
     # ---------------------------
     # Load table
 
-    df = pd.read_fwf(out_txt)
+    # ---------------------------------------------------
+    # Convert fixed-width text to CSV by collapsing spaces
+    # ---------------------------------------------------
+    with open(out_txt, "r") as f:
+        raw_lines = f.readlines()
+
+    clean_lines = []
+    for line in raw_lines:
+        stripped = line.strip()
+
+        # Skip fully blank lines
+        if not stripped:
+            continue
+
+        # Replace 2+ spaces with a single comma
+        cleaned = re.sub(r"\s+", ",", stripped)
+
+        clean_lines.append(cleaned)
+
+    csv_tmp = out_txt + ".csv"
+
+    # Write cleaned CSV
+    with open(csv_tmp, "w") as f:
+        for cl in clean_lines:
+            f.write(cl + "\n")
+
+    # Load CSV normally
+    df = pd.read_csv(csv_tmp)
+        
 
     df["Type"] = df["Type"].astype(str).str.lower().str.strip()
     df = df[df["Type"].str.contains("asym", na=False)]

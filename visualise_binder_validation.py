@@ -88,7 +88,7 @@ def run_ipsae(
     # Run ipSAE
     # ---------------------------
     cmd = [
-        "python", "ipsae.py",
+        "python", f"{os.path.dirname(os.path.abspath(__file__))}/ipsae.py",
         str(pae_file),
         str(cif_file),
         str(pae_cutoff),

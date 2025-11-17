@@ -234,7 +234,7 @@ def make_master_run_sh(output_root: Path) -> None:
 def make_visualisation_sh(output_root: Path) -> None:
     """Create visualization helper script."""
     lines = [
-        f"python visualise_binder_validation.py --ipsae_e 15 --ipsae_d 15 --root_dir {output_root} --generate_data --plot --use_best_model"
+        f"python {os.path.dirname(os.path.abspath(__file__))}/visualise_binder_validation.py --ipsae_e 15 --ipsae_d 15 --root_dir {output_root} --generate_data --plot --use_best_model"
     ]
     sh_path = output_root / "visualise_cofolding_results.sh"
     write_text(sh_path, "\n".join(lines) + "\n")

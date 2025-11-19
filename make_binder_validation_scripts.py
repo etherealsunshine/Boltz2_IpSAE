@@ -231,15 +231,34 @@ def make_master_run_sh(output_root: Path) -> None:
 
 
 
-def make_visualisation_sh(output_root: Path) -> None:
-    """Create visualization helper script."""
-    lines = [
-        f"python {os.path.dirname(os.path.abspath(__file__))}/visualise_binder_validation.py --ipsae_e 15 --ipsae_d 15 --root_dir {output_root} --generate_data --plot --use_best_model"
-    ]
+def make_visualisation_sh(output_root: Path, cfg: Dict[str, Any]) -> None:
+    """Create visualization helper script (config-driven)."""
+
+    viz_cfg = cfg.get("visualisation", {}) or {}
+
+    ipsae_e = viz_cfg.get("ipsae_error_threshold", 15)
+    ipsae_d = viz_cfg.get("ipsae_distance_threshold", 15)
+    use_best = viz_cfg.get("use_best_model", True)
+    num_cpu = viz_cfg.get("num_cpu", None)
+
+    # Flags
+    best_flag = "--use_best_model" if use_best else ""
+    cpu_flag = f"--num_cpu {num_cpu}" if num_cpu is not None else ""
+
+    script_line = (
+        f"python {os.path.dirname(os.path.abspath(__file__))}/visualise_binder_validation.py "
+        f"--ipsae_e {ipsae_e} "
+        f"--ipsae_d {ipsae_d} "
+        f"{cpu_flag} "
+        f"--root_dir {output_root} "
+        f"--generate_data --plot {best_flag}"
+    ).strip()
+
     sh_path = output_root / "visualise_cofolding_results.sh"
-    write_text(sh_path, "\n".join(lines) + "\n")
+    write_text(sh_path, script_line + "\n")
     os.chmod(sh_path, 0o755)
-    print(f"✅ Created {sh_path}")
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +572,8 @@ def main():
         )
 
     make_master_run_sh(output_root)
-    make_visualisation_sh(output_root)
+    make_visualisation_sh(output_root, cfg)
+
     print(f"\n✅ Done. YAMLs and scripts written under: {output_root}\n")
 
 

@@ -44,21 +44,30 @@ def main():
         fasta_name = p.join(in_dir, pdb_name + ".fasta")
 
         with open(fasta_name, "w") as f:
+            sequences = get_sequences_all_chains(pdb_file)
 
             if chain_id is None:
-                # Extract ALL chains
-                sequences = get_sequences_all_chains(pdb_file)
                 for cid, seq in sequences.items():
                     f.write(f">{pdb_name}_{cid}\n{seq}\n")
             else:
-                # Extract only specified chain
-                sequences = get_sequences_all_chains(pdb_file)
                 if chain_id in sequences:
                     f.write(f">{pdb_name}_{chain_id}\n{sequences[chain_id]}\n")
                 else:
                     print(f"⚠ Chain {chain_id} not found in {pdb_file}")
 
         print(f"✅ Saved {fasta_name}")
+
+    if args.merge:
+        merged_path = p.join(in_dir, "combined.fasta")
+        fasta_files = [p.join(in_dir, f) for f in os.listdir(in_dir) if f.endswith(".fasta")]
+
+        with open(merged_path, "w") as outfile:
+            for ff in fasta_files:
+                with open(ff) as infile:
+                    outfile.write(infile.read().strip() + "\n")
+
+        print(f"📘 Merged {len(fasta_files)} FASTA files → {merged_path}")
+
 
 
 def parse_args():
@@ -72,6 +81,11 @@ def parse_args():
         "--chain", "-c", default=None,
         help="Chain ID to extract. Default: extract ALL chains."
     )
+    parser.add_argument(
+        "--merge", "-m", action="store_true",
+        help="Merge all generated FASTA files into a single multi-FASTA file."
+    )
+
     return parser.parse_args()
 
 

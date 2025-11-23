@@ -100,10 +100,20 @@ provide.
 **Binders** (choose exactly one source):
 
 - CSV:
-  - `--binder_csv my_binders.csv`
+  - `--binder_csv path/to/binders.csv`
   - `--binder_name_col binder_name` (default: `name`)
   - `--binder_seq_col binder_sequence` (default: `sequence`)
-  - Sequences can be multi-chain as `CHAINA:CHAINB`.
+  - The CSV must have a header row; at minimum:
+
+    ```text
+    binder_name,binder_sequence
+    2vsm,IVLEPIYWNSSN...
+    6vy5,HEAVYSEQ:LIGHTSEQ
+    ```
+
+  - Sequences can be multi-chain by separating chains with `:` (e.g. heavy:light).
+  - An example CSV using the bundled Nipah binders is provided:
+    - `Boltz2_IpSAE/example_yaml/known_binders.csv`
 
 - FASTA directory:
   - `--binder_fasta_dir path/to/binder_fastas/`
@@ -185,6 +195,28 @@ python Boltz2_IpSAE/run_ipsae_pipeline.py \
   --antitarget_fasta Boltz2_IpSAE/example_yaml/sialidase_2F29.fasta \
   --include_self \
   --out_dir Boltz2_IpSAE/example_yaml/boltz_ipsae_nipah \
+  --recycling_steps 10 \
+  --diffusion_samples 5 \
+  --use_msa_server auto \
+  --ipsae_pae_cutoff 15 \
+  --ipsae_dist_cutoff 15 \
+  --num_cpu 4
+```
+
+Alternatively, you can drive the same example from the **CSV** of binders:
+
+```bash
+python run_ipsae_pipeline.py \
+  --binder_csv Boltz2_IpSAE/example_yaml/known_binders.csv \
+  --binder_name_col binder_name \
+  --binder_seq_col binder_sequence \
+  --target_name nipah_g \
+  --target_fasta Boltz2_IpSAE/example_yaml/nipah_g.fasta \
+  --target_msa Boltz2_IpSAE/example_yaml/nipah.a3m \
+  --antitarget_name Sialidase_2F29 \
+  --antitarget_fasta Boltz2_IpSAE/example_yaml/sialidase_2F29.fasta \
+  --include_self \
+  --out_dir Boltz2_IpSAE/example_yaml/boltz_ipsae_nipah_from_csv \
   --recycling_steps 10 \
   --diffusion_samples 5 \
   --use_msa_server auto \

@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Run Boltz + ipSAE pipeline without manual YAML configuration.
+Run Boltz + ipSAE pipeline binder‑by‑binder without manual YAML.
 
-High-level flow:
-  1) Parse binder(s), target, optional antitarget and self from CLI arguments.
-  2) Generate per-binder YAML files for Boltz (binder vs target / antitarget / self).
-  3) Run `boltz predict` on each YAML, writing outputs under:
-         <out_dir>/binder_<binder_name>/outputs/...
-  4) Run ipSAE over all predictions via visualise_binder_validation.py
-     and write summary CSVs and plots under <out_dir>.
+For each binder the script:
+  1) Builds small Boltz YAMLs for binder vs target / antitarget / self.
+  2) Runs `boltz predict` for that binder only.
+  3) Runs ipSAE on this binder’s predictions.
+  4) Appends a compact summary row (ipSAE mean/std for target and antitarget)
+     to a global CSV and prints the numbers.
 
-By default this script prints clean, high-level progress messages and hides
-Boltz/ipSAE internal logs. Use --verbose to surface full subprocess output.
+After all binders are processed, it also generates the legacy global
+heatmaps and `ipsae_summary_all_binders.csv` via visualise_binder_validation.
+
+By default, the script prints high‑level progress and hides Boltz/ipSAE logs;
+use `--verbose` to surface full subprocess output.
 """
 
 from __future__ import annotations
@@ -20,8 +22,11 @@ import argparse
 import csv
 import subprocess
 import sys
+import types
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+
+import pandas as pd
 
 from make_binder_validation_scripts import (
     add_n_terminal_lysine,
@@ -36,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description=(
             "Run Boltz + ipSAE pipeline for one target and many binders "
-            "without manually writing YAML files."
+            "without manually writing YAML files. Processes binders one‑by‑one."
         )
     )
 
@@ -87,7 +92,7 @@ def parse_args() -> argparse.Namespace:
         help="Prepend 'K' to each binder chain if missing.",
     )
 
-    # Target (required)
+    # Target (required, single)
     ap.add_argument(
         "--target_name",
         required=True,
@@ -111,7 +116,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional MSA file (e.g. .a3m) for target chain 0.",
     )
 
-    # Antitarget (optional)
+    # Antitarget (optional, single)
     ap.add_argument(
         "--antitarget_name",
         type=str,
@@ -187,7 +192,7 @@ def parse_args() -> argparse.Namespace:
         "--use_best_model",
         action="store_true",
         help=(
-            "For summary heatmaps, use only the best model (highest ipSAE_max) "
+            "For global heatmaps, use only the best model (highest ipSAE_max) "
             "per binder/partner instead of averaging across models."
         ),
     )
@@ -195,7 +200,7 @@ def parse_args() -> argparse.Namespace:
         "--num_cpu",
         type=int,
         default=1,
-        help="Number of CPUs to use for ipSAE scoring (default: 1).",
+        help="Number of CPUs to use for ipSAE scoring (default: 1, used for global stage).",
     )
 
     ap.add_argument(
@@ -393,18 +398,121 @@ def run_subprocess(
     return proc.returncode
 
 
+def append_binder_summary(
+    binder_dir: Path,
+    out_root: Path,
+    metric_preference: str = "ipSAE_min",
+) -> None:
+    """
+    Read binder_*/plots/ipsae_summary.csv, compute mean/std of selected metric
+    for target and antitarget, append a one-row summary to out_root/summary/*.csv
+    and print the values.
+    """
+    plots_dir = binder_dir / "plots"
+    csv_path = plots_dir / "ipsae_summary.csv"
+    if not csv_path.is_file():
+        print(f"    !! No ipsae_summary.csv for {binder_dir.name}; skipping summary row.")
+        return
+
+    df = pd.read_csv(csv_path)
+
+    # Backwards-compat: ensure target_type is present
+    if "target_type" not in df.columns and "vs" in df.columns:
+        df["target_type"] = "unknown"
+
+    # Choose metric column
+    preferred = [metric_preference, "ipSAE_min", "ipSAE_max", "ipSAE"]
+    metric_col = next((m for m in preferred if m in df.columns), None)
+    if metric_col is None:
+        print(f"    !! No ipSAE metric columns found in {csv_path}; skipping summary row.")
+        return
+
+    binder_short = binder_dir.name.replace("binder_", "", 1)
+
+    def stats_for_type(tt: str) -> tuple[Optional[float], Optional[float], int]:
+        sub = df[df["target_type"] == tt]
+        n = len(sub)
+        if n == 0:
+            return None, None, 0
+        mean = float(sub[metric_col].mean())
+        std = float(sub[metric_col].std(ddof=1)) if n > 1 else 0.0
+        return mean, std, n
+
+    tgt_mean, tgt_std, tgt_n = stats_for_type("target")
+    at_mean, at_std, at_n = stats_for_type("antitarget")
+
+    # Print to console
+    if tgt_n > 0:
+        print(
+            f"    Binder '{binder_short}': target {metric_col} "
+            f"mean={tgt_mean:.3f}, std={tgt_std:.3f} (n={tgt_n})"
+        )
+    else:
+        print(f"    Binder '{binder_short}': no target rows found in ipsae_summary.csv")
+
+    if at_n > 0:
+        print(
+            f"                             antitarget {metric_col} "
+            f"mean={at_mean:.3f}, std={at_std:.3f} (n={at_n})"
+        )
+
+    # Append to global summary CSV
+    summary_dir = out_root / "summary"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = summary_dir / "binder_pair_summary.csv"
+
+    new_file = not summary_path.is_file()
+    with summary_path.open("a", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        if new_file:
+            writer.writerow(
+                [
+                    "binder_name",
+                    "metric",
+                    "target_ipSAE_mean",
+                    "target_ipSAE_std",
+                    "antitarget_ipSAE_mean",
+                    "antitarget_ipSAE_std",
+                    "n_target_models",
+                    "n_antitarget_models",
+                ]
+            )
+        writer.writerow(
+            [
+                binder_short,
+                metric_col,
+                tgt_mean,
+                tgt_std,
+                at_mean,
+                at_std,
+                tgt_n,
+                at_n,
+            ]
+        )
+
+
 def main() -> None:
     args = parse_args()
     script_dir = Path(__file__).resolve().parent
     out_root = Path(args.out_dir).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
-    print("Stage 1/3: Parsing inputs and preparing Boltz YAMLs...")
+    # Make visualise_binder_validation importable
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    try:
+        import visualise_binder_validation as viz  # type: ignore[import]
+    except ImportError as exc:  # pragma: no cover - import error surface
+        raise SystemExit(
+            f"ERROR: could not import visualise_binder_validation.py from {script_dir} "
+            f"({exc})"
+        )
+
+    print("Stage 1/2: Parsing inputs and configuring binders/partners...")
 
     addK = bool(args.add_n_terminal_lysine)
 
     # --- Load binders ---
-    binders: List[Dict[str, object]]
     if args.binder_csv:
         binders = load_binders_from_csv(
             Path(args.binder_csv).resolve(),
@@ -473,14 +581,27 @@ def main() -> None:
         raise SystemExit("ERROR: At least one target/antitarget must be defined.")
 
     print(
-        f"  Loaded {len(binders)} binder(s) and {len(partners)} partner type(s) "
-        f"(target / antitarget)."
+        f"  Loaded {len(binders)} binder(s) and "
+        f"{1 + int(antitarget is not None)} partner type(s) (target / antitarget / self)."
     )
 
-    # --- Prepare YAMLs and job list ---
-    jobs: List[Dict[str, object]] = []
+    # ------------------------------------------------------------------
+    # Stage 2: Binder‑by‑binder Boltz + ipSAE
+    # ------------------------------------------------------------------
+    print(
+        f"Stage 2/2: Running Boltz + ipSAE per binder ({len(binders)} total binder(s))..."
+    )
 
-    for binder in binders:
+    logs_dir = out_root / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Dummy args object for analyse_binder (needs ipsae_e / ipsae_d)
+    ipsae_args = types.SimpleNamespace(
+        ipsae_e=int(args.ipsae_pae_cutoff),
+        ipsae_d=int(args.ipsae_dist_cutoff),
+    )
+
+    for idx, binder in enumerate(binders, start=1):
         bname = binder["name"]  # type: ignore[assignment]
         bseqs = binder["seqs"]  # type: ignore[assignment]
         bmsas = binder["msas"]  # type: ignore[assignment]
@@ -488,15 +609,21 @@ def main() -> None:
         binder_dir = out_root / f"binder_{bname}"
         binder_dir.mkdir(parents=True, exist_ok=True)
 
-        # binder vs each partner (target / antitarget)
+        print(
+            f"\nBinder {idx}/{len(binders)}: '{bname}' "
+            f"(chains={len(bseqs)}, partners={1 + int(antitarget is not None) + int(args.include_self)})"
+        )
+
+        # --------------------------------------------------------------
+        # 2a. Build YAMLs for this binder
+        # --------------------------------------------------------------
+        partner_jobs: List[Dict[str, object]] = []
+
         for partner in partners:
             role = partner["role"]  # type: ignore[index]
             pname = partner["name"]  # type: ignore[index]
             tseqs = partner["seqs"]  # type: ignore[index]
             tmsas = partner["msas"]  # type: ignore[index]
-
-            if role not in {"target", "antitarget"}:
-                raise SystemExit(f"Unexpected partner role: {role!r}")
 
             yaml_stem = f"binder_{bname}_vs_{role}_{pname}"
             yaml_path = binder_dir / f"{yaml_stem}.yaml"
@@ -510,19 +637,16 @@ def main() -> None:
             )
             yaml_path.write_text(yaml_text, encoding="utf-8")
 
-            jobs.append(
+            partner_jobs.append(
                 {
-                    "binder": bname,
                     "role": role,
                     "partner": pname,
                     "yaml_path": yaml_path,
-                    "binder_dir": binder_dir,
                     "binder_msas": bmsas,
                     "partner_msas": tmsas,
                 }
             )
 
-        # binder vs self (optional)
         if args.include_self:
             role = "self"
             pname = "self"
@@ -540,142 +664,105 @@ def main() -> None:
             )
             yaml_path.write_text(yaml_text, encoding="utf-8")
 
-            jobs.append(
+            partner_jobs.append(
                 {
-                    "binder": bname,
                     "role": role,
                     "partner": pname,
                     "yaml_path": yaml_path,
-                    "binder_dir": binder_dir,
                     "binder_msas": bmsas,
                     "partner_msas": tmsas,
                 }
             )
 
-    if not jobs:
-        raise SystemExit("ERROR: No binder–partner jobs were created.")
+        if not partner_jobs:
+            print("  !! No partner jobs created for this binder; skipping.")
+            continue
 
-    print(
-        f"  Prepared {len(jobs)} Boltz jobs "
-        f"({len(binders)} binder(s) × {len(partners) + int(args.include_self)} partner type(s))."
-    )
+        # --------------------------------------------------------------
+        # 2b. Run Boltz for this binder vs all partners
+        # --------------------------------------------------------------
+        print(f"  Running Boltz for {len(partner_jobs)} complex(es)...")
 
-    # ------------------------------------------------------------------
-    # Stage 2: Run Boltz predictions
-    # ------------------------------------------------------------------
-    print(
-        f"Stage 2/3: Running Boltz predictions for {len(jobs)} complex(es)..."
-    )
+        for jdx, job in enumerate(partner_jobs, start=1):
+            role = job["role"]
+            partner_name = job["partner"]
+            yaml_path = job["yaml_path"]
+            bmsas = job["binder_msas"]
+            tmsas = job["partner_msas"]
 
-    logs_dir = out_root / "logs"
-    total = len(jobs)
-    for idx, job in enumerate(jobs, start=1):
-        binder_name = job["binder"]
-        role = job["role"]
-        partner_name = job["partner"]
-        yaml_path = job["yaml_path"]
-        binder_dir = job["binder_dir"]
-        bmsas = job["binder_msas"]
-        tmsas = job["partner_msas"]
-
-        out_dir = binder_dir / "outputs"
-        use_msa = decide_use_msa_server(
-            args.use_msa_server,
-            binder_msas=bmsas,  # type: ignore[arg-type]
-            partner_msas=tmsas,  # type: ignore[arg-type]
-        )
-
-        print(
-            f"  [{idx}/{total}] Predicting binder='{binder_name}' "
-            f"vs {role}='{partner_name}' with Boltz..."
-        )
-
-        cmd = [
-            sys.executable,
-            "-m",
-            "boltz.main",
-            "predict",
-            yaml_path.name,
-            "--out_dir",
-            str(out_dir),
-            "--recycling_steps",
-            str(args.recycling_steps),
-            "--diffusion_samples",
-            str(args.diffusion_samples),
-        ]
-        if use_msa:
-            cmd.append("--use_msa_server")
-
-        log_name = (
-            f"boltz_binder_{binder_name}_vs_{role}_{partner_name}.log"
-        )
-        log_path = logs_dir / sanitize_name(log_name)
-
-        returncode = run_subprocess(
-            cmd=cmd,
-            cwd=binder_dir,
-            log_path=log_path,
-            verbose=args.verbose,
-        )
-        if returncode != 0:
-            print(
-                f"    !! Boltz failed for binder='{binder_name}' vs {role}='{partner_name}'. "
-                f"See log: {log_path}"
+            out_dir = binder_dir / "outputs"
+            use_msa = decide_use_msa_server(
+                args.use_msa_server,
+                binder_msas=bmsas,  # type: ignore[arg-type]
+                partner_msas=tmsas,  # type: ignore[arg-type]
             )
-        else:
-            if not args.verbose:
-                print(f"    Done. (log: {log_path})")
 
-    # ------------------------------------------------------------------
-    # Stage 3: Run ipSAE on all predictions and summarize
-    # ------------------------------------------------------------------
-    print(
-        "Stage 3/3: Running ipSAE on predicted complexes and generating summaries..."
-    )
+            print(
+                f"    [{jdx}/{len(partner_jobs)}] Boltz: binder='{bname}' "
+                f"vs {role}='{partner_name}'..."
+            )
 
-    visualise_script = script_dir / "visualise_binder_validation.py"
-    if not visualise_script.is_file():
-        raise SystemExit(
-            f"ERROR: visualise_binder_validation.py not found at {visualise_script}"
+            cmd = [
+                sys.executable,
+                "-m",
+                "boltz.main",
+                "predict",
+                yaml_path.name,
+                "--out_dir",
+                str(out_dir),
+                "--recycling_steps",
+                str(args.recycling_steps),
+                "--diffusion_samples",
+                str(args.diffusion_samples),
+            ]
+            if use_msa:
+                cmd.append("--use_msa_server")
+
+            log_name = f"boltz_binder_{bname}_vs_{role}_{partner_name}.log"
+            log_path = logs_dir / sanitize_name(log_name)
+
+            returncode = run_subprocess(
+                cmd=cmd,
+                cwd=binder_dir,
+                log_path=log_path,
+                verbose=args.verbose,
+            )
+            if returncode != 0:
+                print(
+                    f"      !! Boltz failed for binder='{bname}' vs {role}='{partner_name}'. "
+                    f"See log: {log_path}"
+                )
+            elif not args.verbose:
+                print(f"      Done. (log: {log_path})")
+
+        # --------------------------------------------------------------
+        # 2c. Run ipSAE for this binder only
+        # --------------------------------------------------------------
+        print("  Running ipSAE + binder‑level summaries...")
+        viz.analyse_binder(binder_dir, ipsae_args)
+        append_binder_summary(
+            binder_dir=binder_dir,
+            out_root=out_root,
+            metric_preference="ipSAE_min",
         )
 
-    cmd_ipsae = [
-        sys.executable,
-        str(visualise_script),
-        "--ipsae_e",
-        str(args.ipsae_pae_cutoff),
-        "--ipsae_d",
-        str(args.ipsae_dist_cutoff),
-        "--root_dir",
-        str(out_root),
-        "--generate_data",
-        "--plot",
-        "--num_cpu",
-        str(args.num_cpu),
-    ]
-    if args.use_best_model:
-        cmd_ipsae.append("--use_best_model")
-
-    ipsae_log = logs_dir / "ipsae_pipeline.log"
-    returncode = run_subprocess(
-        cmd=cmd_ipsae,
-        cwd=out_root,
-        log_path=ipsae_log,
-        verbose=args.verbose,
+    # --------------------------------------------------------------
+    # Final global summaries / heatmaps (optional but kept)
+    # --------------------------------------------------------------
+    print(
+        "\nFinalizing global ipSAE summaries and heatmaps across all binders..."
     )
-    if returncode != 0:
-        print(
-            f"    !! ipSAE pipeline failed. See log: {ipsae_log}"
-        )
-        raise SystemExit(returncode)
-    else:
-        if not args.verbose:
-            print(f"    ipSAE summaries written. (log: {ipsae_log})")
+
+    viz.plot_overall(
+        out_root,
+        use_best_model=args.use_best_model,
+    )
 
     print(
-        f"Done. Results are under: {out_root}\n"
+        f"\nDone. Results are under: {out_root}\n"
         f"  - Per-binder summaries and plots: {out_root}/binder_*/plots\n"
-        f"  - Global heatmaps and CSVs:        {out_root}/summary\n"
+        f"  - Compact binder summary table:   {out_root}/summary/binder_pair_summary.csv\n"
+        f"  - Global ipSAE data & heatmaps:   {out_root}/summary/\n"
     )
 
 

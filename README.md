@@ -183,18 +183,18 @@ The repo includes:
 - Known binders: `Boltz2_IpSAE/example_yaml/known_binders/`
 - Sialidase off-target FASTA: `Boltz2_IpSAE/example_yaml/sialidase_2F29.fasta`
 
-Run the pipeline from the repo root:
+Run the pipeline from the `Boltz2_IpSAE` directory:
 
 ```bash
-python Boltz2_IpSAE/run_ipsae_pipeline.py \
-  --binder_fasta_dir Boltz2_IpSAE/example_yaml/known_binders \
+python run_ipsae_pipeline.py \
+  --binder_fasta_dir example_yaml/known_binders \
   --target_name nipah_g \
-  --target_fasta Boltz2_IpSAE/example_yaml/nipah_g.fasta \
-  --target_msa Boltz2_IpSAE/example_yaml/nipah.a3m \
+  --target_fasta example_yaml/nipah_g.fasta \
+  --target_msa example_yaml/nipah.a3m \
   --antitarget_name Sialidase_2F29 \
-  --antitarget_fasta Boltz2_IpSAE/example_yaml/sialidase_2F29.fasta \
+  --antitarget_fasta example_yaml/sialidase_2F29.fasta \
   --include_self \
-  --out_dir Boltz2_IpSAE/example_yaml/boltz_ipsae_nipah \
+  --out_dir example_yaml/boltz_ipsae_nipah \
   --recycling_steps 10 \
   --diffusion_samples 5 \
   --use_msa_server auto \
@@ -207,16 +207,16 @@ Alternatively, you can drive the same example from the **CSV** of binders:
 
 ```bash
 python run_ipsae_pipeline.py \
-  --binder_csv Boltz2_IpSAE/example_yaml/known_binders.csv \
+  --binder_csv example_yaml/known_binders.csv \
   --binder_name_col binder_name \
   --binder_seq_col binder_sequence \
   --target_name nipah_g \
-  --target_fasta Boltz2_IpSAE/example_yaml/nipah_g.fasta \
-  --target_msa Boltz2_IpSAE/example_yaml/nipah.a3m \
+  --target_fasta example_yaml/nipah_g.fasta \
+  --target_msa example_yaml/nipah.a3m \
   --antitarget_name Sialidase_2F29 \
-  --antitarget_fasta Boltz2_IpSAE/example_yaml/sialidase_2F29.fasta \
+  --antitarget_fasta example_yaml/sialidase_2F29.fasta \
   --include_self \
-  --out_dir Boltz2_IpSAE/example_yaml/boltz_ipsae_nipah_from_csv \
+  --out_dir example_yaml/boltz_ipsae_nipah_from_csv \
   --recycling_steps 10 \
   --diffusion_samples 5 \
   --use_msa_server auto \

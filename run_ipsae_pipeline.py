@@ -267,21 +267,47 @@ def load_binders_from_csv(
     addK: bool,
 ) -> List[Dict[str, object]]:
     binders: List[Dict[str, object]] = []
-    with csv_path.open(newline="", encoding="utf-8") as fh:
+    # Use utf-8-sig to transparently strip any UTF-8 BOM from the header
+    with csv_path.open(newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
         if reader.fieldnames is None:
             raise ValueError(f"CSV file has no header: {csv_path}")
-        if name_col not in reader.fieldnames:
-            raise ValueError(
-                f"CSV file {csv_path} missing binder name column {name_col!r}."
+        fieldnames = [fn.strip() for fn in reader.fieldnames]
+
+        # Try to honour user-specified columns first
+        effective_name_col = name_col
+        effective_seq_col = seq_col
+
+        missing_name = effective_name_col not in fieldnames
+        missing_seq = effective_seq_col not in fieldnames
+
+        if (missing_name or missing_seq) and len(fieldnames) >= 2:
+            # Fallback: use first two columns with a loud warning
+            print(
+                f"WARNING: CSV {csv_path} does not contain expected columns "
+                f"{name_col!r} / {seq_col!r}. "
+                f"Falling back to first two columns:\n"
+                f"  binder_name_col = {fieldnames[0]!r}\n"
+                f"  binder_seq_col  = {fieldnames[1]!r}"
             )
-        if seq_col not in reader.fieldnames:
+            effective_name_col = fieldnames[0]
+            effective_seq_col = fieldnames[1]
+            missing_name = missing_seq = False
+
+        if missing_name:
             raise ValueError(
-                f"CSV file {csv_path} missing binder sequence column {seq_col!r}."
+                f"CSV file {csv_path} missing binder name column {name_col!r}. "
+                f"Header columns: {fieldnames}"
             )
+        if missing_seq:
+            raise ValueError(
+                f"CSV file {csv_path} missing binder sequence column {seq_col!r}. "
+                f"Header columns: {fieldnames}"
+            )
+
         for row in reader:
-            raw_name = (row.get(name_col) or "").strip()
-            raw_seq = (row.get(seq_col) or "").strip()
+            raw_name = (row.get(effective_name_col) or "").strip()
+            raw_seq = (row.get(effective_seq_col) or "").strip()
             if not raw_name or not raw_seq:
                 continue
             name = sanitize_name(raw_name)

@@ -22,6 +22,7 @@ This folder contains:
   - streams a compact summary CSV and prints per-binder ipSAE numbers,
   - produces the same global ipSAE heatmaps and `ipsae_summary_all_binders.csv`
     as the legacy flow.
+  - `modal_run.py` - a script to run your jobs on Modal. (currently only tested with YAML input)
 
 The examples under `example_yaml/` provide a complete Nipah G use case
 including known binders.
@@ -264,3 +265,20 @@ The older `make_binder_validation_scripts.py` + `run_all_cofolding.sh` +
 but `run_ipsae_pipeline.py` should usually be more convenient: it exposes the
 same functionality from a single CLI entry point and streams binder‑level
 summaries into a small CSV as the script progresses.
+
+
+## 5. *Work in progress* Run code on Modal
+to run your job in modal
+`modal run get_started.py::main --yaml-file path/to/config.yaml`
+Once Boltz predicts outputs, use:
+```bash
+modal run get_started.py::get_ipsae_scores \
+    --prediction-dir <boltz_output_dir> \
+    --pae-cutoff 15 \
+    --dist-cutoff 15
+```
+Note: All outputs are stored in:
+`/data/outputs/`
+
+Use:
+`modal volume get boltz-data --mount /local/path`
